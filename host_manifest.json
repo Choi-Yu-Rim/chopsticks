@@ -1,0 +1,9 @@
+{
+    "name": "com.spoon.connector",
+    "description": "Spoon Connector Host (DEV)",
+    "path": "C:\\IntelliJ_workspace\\chopsticks\\python_app\\run_host.bat",
+    "type": "stdio",
+    "allowed_origins": [
+        "chrome-extension://kccgocnhnonpbjnjkhfgemifanncjckd/"
+    ]
+}
