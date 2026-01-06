@@ -1,11 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "젓가락(樂) Connector",
-  "version": "2.0",
-  "permissions": [
-    "storage",
-    "nativeMessaging"
-  ],
+  "name": "chopsticks",
+  "version": "0.1.0",
+  "permissions": ["nativeMessaging"],
   "background": {
     "service_worker": "background.js"
   },
