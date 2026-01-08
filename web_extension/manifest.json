@@ -1,15 +1,37 @@
 {
   "manifest_version": 3,
-  "name": "chopsticks",
+  "name": "Spoon Auto Reply",
   "version": "0.1.0",
-  "permissions": ["nativeMessaging"],
+  "description": "Spoon 라이브 시스템 메시지에 자동 응답하는 크롬 확장 프로그램",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://kr-gw.spooncast.net/*",
+    "https://*.spooncast.net/*"
+  ],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://www.spooncast.net/*"],
-      "js": ["content.js"]
+      "matches": [
+        "https://*.spooncast.net/*"
+      ],
+      "js": [
+        "content.js"
+      ],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "hook.js"
+      ],
+      "matches": [
+        "https://*.spooncast.net/*"
+      ]
     }
   ]
 }
