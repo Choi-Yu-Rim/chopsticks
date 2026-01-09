@@ -1,320 +1,368 @@
 // content.js
-// ----------------------------------------
-// ✅ 역할
-// - hook.js를 페이지(main world)에 주입해서 /chat/message 요청을 캡처
-// - hook.js → window.postMessage 로 넘어온 SEND_CFG를 background로 전달
-// - DOM MutationObserver로 시스템 메시지(입장/좋아요 등) 텍스트를 감지해서
-//   background로 CHAT_EVENT 전송
-//   (단, 채팅 리스트에서 "사용자 채팅 DOM"은 system 후보에서 제외)
-// - background에서 오는 AUTO_SEND_CHAT을 받아서 실제 /chat/message API 호출
-// ----------------------------------------
-let SEND_CFG = null;
+console.log("✅ content script loaded");
 
-const DEBUG = true;
-function clog(...args) {
-    if (DEBUG) console.log("[CONTENT]", ...args);
-}
+let EXT_INVALIDATED = false;
 
-// ------------------------------
-// 1) hook.js 주입
-// ------------------------------
-(function injectHook() {
+/**
+ * background로 안전하게 메시지 보내기 (fallback 용)
+ */
+function safeSendMessage(payload) {
+    if (EXT_INVALIDATED) return;
+
     try {
-        clog("content script loaded");
-
-        const s = document.createElement("script");
-        s.src = chrome.runtime.getURL("hook.js");
-        s.onload = () => {
-            clog("hook injected via src:", s.src);
-            s.remove();
-        };
-        (document.head || document.documentElement).appendChild(s);
+        chrome.runtime.sendMessage(payload);
     } catch (e) {
-        console.warn("[CONTENT] hook inject failed:", e);
-    }
-})();
-
-// ------------------------------
-// 2) hook.js → background로 SEND_CFG 전달
-// ------------------------------
-window.addEventListener("message", (event) => {
-    if (event.source !== window) return;
-    const data = event.data;
-    if (!data || data.__SPOON_EXT__ !== true) return;
-
-    if (data.type === "CAPTURE_SEND_CFG" && data.cfg?.url) {
-        SEND_CFG = data.cfg; // 🔹 로컬에도 저장
-        clog("CAPTURE_SEND_CFG from hook:", data.cfg);
-
-        try {
-            chrome.runtime.sendMessage({
-                action: "SET_SEND_CFG",
-                cfg: data.cfg,
-            });
-        } catch (e) {
-            console.warn("[CONTENT] sendMessage SET_SEND_CFG error:", e);
+        const msg = String(e?.message || e || "");
+        // 확장 종료/리로드 시 에러 처리
+        if (msg.includes("Extension context invalidated")) {
+            EXT_INVALIDATED = true;
+            console.warn("⚠️ Extension context invalidated. Stop sending messages.");
+        } else {
+            console.error("❌ safeSendMessage error:", e);
         }
     }
-});
+}
 
-// ------------------------------
-// 3) 시스템 메시지 → background로 CHAT_EVENT 보내기
-// ------------------------------
-function sendSystemMessageToBG(text) {
-    const msgText = String(text ?? "").trim();
-    if (!msgText) return;
+/* ------------------------------------------------------------------
+ *  채팅창에 직접 메시지 보내기 (DOM 조작)
+ * ------------------------------------------------------------------ */
 
-    clog("SYSTEM DETECTED:", msgText);
-
+/**
+ * 스푼 웹 UI에 직접 채팅을 입력하고 전송
+ * - true  : DOM으로 전송 성공
+ * - false : 입력창/전송버튼을 못 찾음 → background fallback 사용
+ */
+function sendChatMessageViaDom(message) {
     try {
-        chrome.runtime.sendMessage({
-            action: "CHAT_EVENT",
-            payload: {
-                kind: "system",
-                text: msgText,
-            },
-        });
-    } catch (e) {
-        console.warn("[CONTENT] sendSystemMessageToBG error:", e);
-    }
-}
+        if (!message || !message.trim()) {
+            console.warn("⚠️ empty message, skip sendChatMessageViaDom");
+            return false;
+        }
 
-// ------------------------------
-// 4) DOM MutationObserver로 시스템 메시지 감지
-// ------------------------------
-function isSystemMessageText(text) {
-    const t = String(text ?? "").replace(/\s+/g, " ").trim();
-    if (!t) return false;
+        // 1) 입력창 찾기
+        let input =
+            document.querySelector('textarea[placeholder="대화를 입력하세요."]') ||
+            document.querySelector('input[placeholder="대화를 입력하세요."]');
 
-    // 입장
-    if (/님이\s*입장하였습니다\.?\s*$/.test(t)) return true;
-
-    // 좋아요 버튼
-    if (/님이\s*좋아요를\s*(누르셨어요|눌렀어요)\.?\s*$/.test(t)) return true;
-
-    // 좋아요 N개 (스티커 포함)
-    // → 문장 끝에서만 허용 (감사합니다 같은 꼬리 붙으면 매치 안 되게)
-    if (/좋아요\s+\d+\s*개[.!…]*\s*$/.test(t)) return true;
-
-    return false;
-}
-
-function extractTextFromNode(node) {
-    if (!node) return "";
-    if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || "";
-    if (node.nodeType !== Node.ELEMENT_NODE) return "";
-    return node.innerText || node.textContent || "";
-}
-
-// 🔴 “입력창/텍스트박스 안에서 생긴 노드인지” 체크
-function isInsideUserInputArea(node) {
-    if (!node) return false;
-
-    let el =
-        node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    while (el && el !== document.body) {
-        try {
-            if (
-                el.matches(
-                    [
-                        "textarea",
-                        "input",
-                        "[contenteditable='true']",
-                        "[role='textbox']",
-                        "[data-testid*='input']",
-                    ].join(",")
-                )
-            ) {
-                return true;
+        // 입력창이 버튼/박스 뒤에 숨어 있으면 열어주기
+        if (!input) {
+            const openBox = Array.from(
+                document.querySelectorAll("button, div, span")
+            ).find((el) => (el.textContent || "").includes("대화를 입력하세요."));
+            if (openBox) {
+                openBox.click();
             }
-        } catch {
-            // ignore
-        }
-        el = el.parentElement;
-    }
-    return false;
-}
 
-// 🔹 채팅 리스트용: 가장 가까운 li.sc-kcoZcm 찾기
-function findChatLi(node) {
-    if (!node) return null;
-
-    let el =
-        node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
-    while (el && el !== document.body) {
-        if (el.tagName === "LI" && el.classList.contains("sc-kcoZcm")) {
-            return el;
-        }
-        el = el.parentElement;
-    }
-    return null;
-}
-
-// 한 번 처리한 li 는 다시 안 보기 위한 캐시 (중복 방지용 – 선택)
-const processedLis = new WeakSet();
-
-function handleAddedNode(node) {
-    // 0) 입력 영역 안에서 생긴 변화는 전부 무시
-    if (isInsideUserInputArea(node)) {
-        return;
-    }
-
-    // 1) 우선 이 노드 "안에" 사용자 채팅 말풍선이 있는지부터 검사
-    //    (data-index 래퍼 div 가 추가될 때, 그 div 안에 live-comment-list-item-container 가 들어있음)
-    if (node.nodeType === Node.ELEMENT_NODE) {
-        const el = /** @type {Element} */ (node);
-        if (
-            el.matches(
-                ".live-comment-list-item-container, .comment-wrap, .comment-text"
-            ) ||
-            el.querySelector(
-                ".live-comment-list-item-container, .comment-wrap, .comment-text"
-            )
-        ) {
-            // 사용자 채팅이니까 system 후보에서 제외
-            // clog("[EVENT] user chat container (ignore for system):", extractTextFromNode(el).trim());
-            return;
-        }
-    }
-
-    // 2) 채팅 리스트(li.sc-kcoZcm) 안에서 생긴 변화인지 확인
-    const li = findChatLi(node);
-    if (li) {
-        if (processedLis.has(li)) return;
-        processedLis.add(li);
-
-        const rawFromLi = extractTextFromNode(li);
-        const textFromLi = String(rawFromLi ?? "").trim();
-        if (!textFromLi) return;
-
-        // li 안에 live-comment-list-item-container 가 있으면 사용자 채팅
-        if (li.querySelector(".live-comment-list-item-container")) {
-            // clog("[EVENT] user chat li (ignore for system):", textFromLi);
-            return;
+            input =
+                document.querySelector('textarea[placeholder="대화를 입력하세요."]') ||
+                document.querySelector('input[placeholder="대화를 입력하세요."]');
         }
 
-        // live-comment-list-item-container 가 없는 li.sc-kcoZcm 은
-        //   스푼 시스템이 그린 메시지(입장/좋아요/좋아요 스티커 등)
-        if (isSystemMessageText(textFromLi)) {
-            sendSystemMessageToBG(textFromLi);
-        }
-        return;
-    }
-
-    // 3) 채팅 리스트 밖에서 생긴 노드에 대해서는
-    //    예전 B 로직 그대로 fallback (혹시 모를 케이스 대비)
-    const raw = extractTextFromNode(node);
-    if (!raw) return;
-
-    const text = raw.trim();
-    if (!text) return;
-
-    if (isSystemMessageText(text)) {
-        sendSystemMessageToBG(text);
-    }
-}
-
-function setupMutationObserver() {
-    try {
-        const target = document.body;
-        if (!target) {
-            setTimeout(setupMutationObserver, 500);
-            return;
+        if (!input) {
+            console.warn("⚠️ chat input not found");
+            return false;
         }
 
-        const observer = new MutationObserver((mutations) => {
-            for (const m of mutations) {
-                if (m.type === "childList" && m.addedNodes?.length) {
-                    m.addedNodes.forEach((node) => {
-                        handleAddedNode(node);
-                    });
+        // 2) 현재 네가 치고 있던 내용 백업
+        const wasFocused = document.activeElement === input;
+        const prevValue = input.value;
+        const prevSelectionStart = input.selectionStart;
+        const prevSelectionEnd = input.selectionEnd;
+
+        // 3) 자동응답 내용으로 잠깐 교체 + input 이벤트
+        const proto = Object.getPrototypeOf(input);
+        const desc = Object.getOwnPropertyDescriptor(proto, "value");
+        if (desc && typeof desc.set === "function") {
+            desc.set.call(input, message);
+        } else {
+            input.value = message;
+        }
+        input.dispatchEvent(new Event("input", { bubbles: true, cancelable: true }));
+
+        // 4) 전송 버튼 클릭 or 엔터 전송
+        const sendBtn =
+            document.querySelector('button[aria-label="보내기"]') ||
+            document.querySelector('button[title="보내기"]') ||
+            Array.from(document.querySelectorAll("button")).find((btn) => {
+                const txt = (btn.textContent || "").trim();
+                return txt === "전송" || txt === "보내기";
+            });
+
+        if (sendBtn) {
+            sendBtn.click();
+        } else {
+            const keydown = new KeyboardEvent("keydown", {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true,
+            });
+            input.dispatchEvent(keydown);
+
+            const keyup = new KeyboardEvent("keyup", {
+                key: "Enter",
+                code: "Enter",
+                keyCode: 13,
+                which: 13,
+                bubbles: true,
+                cancelable: true,
+            });
+            input.dispatchEvent(keyup);
+        }
+
+        // 5) 아주 짧은 딜레이 후에 네가 치던 내용 원래대로 복구
+        setTimeout(() => {
+            try {
+                const proto2 = Object.getPrototypeOf(input);
+                const desc2 = Object.getOwnPropertyDescriptor(proto2, "value");
+                if (desc2 && typeof desc2.set === "function") {
+                    desc2.set.call(input, prevValue);
+                } else {
+                    input.value = prevValue;
                 }
+                input.dispatchEvent(
+                    new Event("input", { bubbles: true, cancelable: true })
+                );
+
+                if (wasFocused) {
+                    input.focus();
+                    if (
+                        typeof prevSelectionStart === "number" &&
+                        typeof prevSelectionEnd === "number"
+                    ) {
+                        input.setSelectionRange(prevSelectionStart, prevSelectionEnd);
+                    }
+                }
+            } catch (e) {
+                console.error("❌ restore input error:", e);
             }
-        });
+        }, 30);
 
-        observer.observe(target, {
-            childList: true,
-            subtree: true,
-        });
-
-        clog("MutationObserver attached on <body>");
-    } catch (e) {
-        console.warn("[CONTENT] setupMutationObserver error:", e);
-    }
-}
-
-if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", setupMutationObserver, {
-        once: true,
-    });
-} else {
-    setupMutationObserver();
-}
-
-// ------------------------------
-// 5) background → AUTO_SEND_CHAT 처리 (API 전송)
-// ------------------------------
-function lowerKeyMap(obj) {
-    const out = {};
-    for (const k of Object.keys(obj || {})) {
-        out[k.toLowerCase()] = obj[k];
-    }
-    return out;
-}
-
-async function sendChatViaApi(message) {
-    if (!SEND_CFG || !SEND_CFG.url) {
-        clog("AUTO_SEND_CHAT but SEND_CFG is not ready yet");
-        return;
-    }
-
-    const url = SEND_CFG.url;
-    const headers = { ...(SEND_CFG.headers || {}) };
-    const lower = lowerKeyMap(headers);
-
-    if (!("content-type" in lower)) {
-        headers["content-type"] = "application/json";
-    }
-
-    const body = JSON.stringify({
-        message,
-        messageType: "GENERAL_MESSAGE",
-    });
-
-    clog("AUTO_SEND_CHAT fetch:", { url, body });
-
-    const res = await fetch(url, {
-        method: "POST",
-        headers,
-        body,
-        credentials: "include",
-    });
-
-    const text = await res.text().catch(() => "");
-    clog("AUTO_SEND_CHAT result:", res.status, text.slice(0, 200));
-}
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    try {
-        if (!msg || msg.action !== "AUTO_SEND_CHAT") return;
-
-        const message = msg.message;
-        if (!message) {
-            sendResponse?.({ ok: false, error: "no message" });
-            return true;
-        }
-
-        sendChatViaApi(message)
-            .then(() => {
-                sendResponse?.({ ok: true });
-            })
-            .catch((e) => {
-                console.warn("[CONTENT] AUTO_SEND_CHAT error:", e);
-                sendResponse?.({ ok: false, error: String(e) });
-            });
-
+        console.log("✅ sendChatMessageViaDom sent:", message);
         return true;
     } catch (e) {
-        console.warn("[CONTENT] onMessage(AUTO_SEND_CHAT) error:", e);
+        console.error("❌ sendChatMessageViaDom error:", e);
+        return false;
     }
-});
+}
+
+
+/* ------------------------------------------------------------------
+ *  좋아요 자동응답 관련 상태값
+ * ------------------------------------------------------------------ */
+
+// 이미 처리한 좋아요 이벤트 ID들 (중복 방지)
+const processedLikeIds = new Set();
+
+// 좋아요 응답 큐
+const likeReplyQueue = [];
+
+// 현재 좋아요 응답 전송 중인지 여부 (동시 전송 방지)
+let isProcessingLikeQueue = false;
+
+// 좋아요 응답 간 최소 간격 (ms)
+const LIKE_REPLY_INTERVAL = 2000;
+
+/**
+ * 간단한 sleep 유틸
+ */
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * 좋아요 자동응답 큐에 쌓기
+ */
+function enqueueLikeReply(likeEvent) {
+    const { likeId } = likeEvent;
+    if (!likeId) {
+        console.warn("⚠️ likeEvent without likeId, skip:", likeEvent);
+        return;
+    }
+
+    if (processedLikeIds.has(likeId)) {
+        // 이미 처리한 좋아요 이벤트는 무시
+        console.log("↪️ already processed likeId, skip:", likeId);
+        return;
+    }
+
+    processedLikeIds.add(likeId);
+    likeReplyQueue.push(likeEvent);
+    console.log("📥 enqueue like reply:", likeEvent);
+
+    processLikeQueue(); // 비동기로 큐 처리 시작
+}
+
+/**
+ * 좋아요 자동응답 큐 처리
+ */
+async function processLikeQueue() {
+    if (isProcessingLikeQueue) return;
+    isProcessingLikeQueue = true;
+
+    try {
+        while (likeReplyQueue.length > 0) {
+            const event = likeReplyQueue.shift(); // ✅ 큐에서 제거
+            console.log("📤 send like reply:", event);
+
+            const text = event.replyText || "좋아요 고마워요 💖";
+
+            // 1순위: DOM으로 바로 보내기 (입력값 보존)
+            const sent = sendChatMessageViaDom(text);
+
+            // 혹시 DOM 구조 바뀌어서 실패하면, 예전처럼 background로 던지기
+            if (!sent) {
+                safeSendMessage({
+                    type: "SP_AUTO_REPLY",
+                    payload: {
+                        kind: "LIKE",
+                        likeId: event.likeId,
+                        userName: event.userName,
+                        message: text,
+                    },
+                });
+            }
+
+            await sleep(LIKE_REPLY_INTERVAL);
+        }
+    } catch (e) {
+        console.error("❌ processLikeQueue error:", e);
+    } finally {
+        isProcessingLikeQueue = false;
+    }
+}
+
+
+/* ------------------------------------------------------------------
+ *  DOM에서 좋아요 이벤트 감지
+ * ------------------------------------------------------------------ */
+
+/**
+ * 이 노드가 내가 보낸 채팅인지 대략 판별
+ */
+function isFromSelf(node) {
+    try {
+        const nameEl = node.querySelector(".comment-name .text-box");
+        const name = (nameEl?.textContent || "").trim();
+        if (!name) return false;
+
+        // 너 닉네임 기준
+        if (name === "일하는 담담" || name.includes("담담봇")) {
+            return true;
+        }
+    } catch {
+        // 실패하면 그냥 false
+    }
+    return false;
+}
+
+/**
+ * 이 노드가 "좋아요" 시스템 메시지인지 판별
+ * 예: "🧣우기님이 좋아요를 누르셨어요."
+ *     "OOO님이 좋아요 10개를 누르셨어요."
+ */
+function parseLikeSystemMessage(node) {
+    if (!node || !(node instanceof HTMLElement)) return null;
+
+    const text = (node.innerText || "").trim();
+    if (!text) return null;
+
+    // 내가 보낸 메시지는 무시
+    if (isFromSelf(node)) return null;
+
+    const likeRegex =
+        /(.+?)님이\s+좋아요(?:를)?(?:\s*(\d+)개)?(?:를)?\s*누르셨어요[.!]?/;
+    const match = text.match(likeRegex);
+    if (!match) return null;
+
+    const userName = (match[1] || "").trim();
+    const count = match[2] ? Number(match[2]) : 0;
+
+    // likeId는 data-index를 우선 사용
+    let likeId = null;
+    const indexContainer = node.closest("[data-index]");
+    if (indexContainer) {
+        likeId = indexContainer.getAttribute("data-index");
+    }
+    if (!likeId) {
+        likeId = text; // 그래도 없으면 텍스트 기반
+    }
+
+    return {
+        likeId,
+        userName,
+        count,
+        rawText: text,
+    };
+}
+
+/**
+ * MutationObserver 콜백
+ */
+function handleMutations(mutations) {
+    for (const mutation of mutations) {
+        if (!mutation.addedNodes || mutation.addedNodes.length === 0) continue;
+
+        mutation.addedNodes.forEach((node) => {
+            if (!(node instanceof HTMLElement)) return;
+
+            // wrapper div 밑에 li.sc-kcoZcm 이 있을 수 있으니 한 번 더 내려가기
+            let targetNode = node;
+            if (!targetNode.matches("li.sc-kcoZcm")) {
+                const li = node.querySelector("li.sc-kcoZcm");
+                if (li) targetNode = li;
+            }
+
+            const likeEvent = parseLikeSystemMessage(targetNode);
+            if (likeEvent) {
+                console.log("✨ detected like system message:", likeEvent);
+                enqueueLikeReply({
+                    ...likeEvent,
+                    replyText: buildLikeReplyText(likeEvent),
+                });
+            }
+        });
+    }
+}
+
+/**
+ * 좋아요에 대한 실제 자동응답 멘트 생성
+ */
+function buildLikeReplyText(likeEvent) {
+    const { userName, count } = likeEvent;
+
+    if (userName && count) {
+        return `${userName}님, 좋아요 ${count}개 고마워요 💕`;
+    } else if (userName) {
+        return `${userName}님, 좋아요 고마워요 💕`;
+    }
+    return "좋아요 고마워요 💕";
+}
+
+/**
+ * 채팅 영역에 MutationObserver 붙이기
+ */
+function initLikeObserver() {
+    const chatContainer = document.querySelector(
+        '.live-detail-comment-list [data-testid="virtuoso-item-list"]'
+    );
+
+    if (!chatContainer) {
+        console.warn("⚠️ chat container not found. retry in 2s");
+        setTimeout(initLikeObserver, 2000);
+        return;
+    }
+
+    const observer = new MutationObserver(handleMutations);
+    observer.observe(chatContainer, {
+        childList: true,
+        subtree: true,
+    });
+
+    console.log("👀 Like MutationObserver attached");
+}
+
+// 페이지 로드 후 약간 딜레이 두고 초기화
+setTimeout(initLikeObserver, 2000);
