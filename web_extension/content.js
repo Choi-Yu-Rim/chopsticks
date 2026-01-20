@@ -236,7 +236,89 @@ async function processLikeQueue() {
 
 
 /* ------------------------------------------------------------------
- *  DOM에서 좋아요 이벤트 감지
+ *  입장 자동응답 관련 상태값
+ * ------------------------------------------------------------------ */
+
+// 이미 처리한 입장 이벤트 ID들 (중복 방지)
+const processedEnterIds = new Set();
+
+// 입장 응답 큐
+const enterReplyQueue = [];
+
+// 현재 입장 응답 전송 중인지 여부
+let isProcessingEnterQueue = false;
+
+// 입장 응답 간 최소 간격 (ms)
+const ENTER_REPLY_INTERVAL = 2000;
+
+// "XXX님이 입장하였습니다." 패턴
+const ENTER_MESSAGE_REGEX = /(.+?)님이\s*입장하였습니다[.!]?/;
+
+
+/**
+ * 입장 자동응답 큐에 쌓기
+ */
+function enqueueEnterReply(enterEvent) {
+    const { enterId } = enterEvent;
+    if (!enterId) {
+        console.warn("⚠️ enterEvent without enterId, skip:", enterEvent);
+        return;
+    }
+
+    if (processedEnterIds.has(enterId)) {
+        console.log("↪️ already processed enterId, skip:", enterId);
+        return;
+    }
+
+    processedEnterIds.add(enterId);
+    enterReplyQueue.push(enterEvent);
+    console.log("📥 enqueue enter reply:", enterEvent);
+
+    processEnterQueue();
+}
+
+/**
+ * 입장 자동응답 큐 처리
+ */
+async function processEnterQueue() {
+    if (isProcessingEnterQueue) return;
+    isProcessingEnterQueue = true;
+
+    try {
+        while (enterReplyQueue.length > 0) {
+            const event = enterReplyQueue.shift();
+            console.log("📤 send enter reply:", event);
+
+            const text = event.replyText || buildEnterReplyText(event);
+
+            // DOM으로 먼저 시도
+            const sent = sendChatMessageViaDom(text);
+
+            if (!sent) {
+                // DOM 구조 깨졌을 때 background로 fallback
+                safeSendMessage({
+                    type: "SP_AUTO_REPLY",
+                    payload: {
+                        kind: "ENTER",
+                        enterId: event.enterId,
+                        userName: event.userName,
+                        message: text,
+                    },
+                });
+            }
+
+            await sleep(ENTER_REPLY_INTERVAL);
+        }
+    } catch (e) {
+        console.error("❌ processEnterQueue error:", e);
+    } finally {
+        isProcessingEnterQueue = false;
+    }
+}
+
+
+/* ------------------------------------------------------------------
+ *  DOM에서 이벤트 감지
  * ------------------------------------------------------------------ */
 
 /**
@@ -299,6 +381,49 @@ function parseLikeSystemMessage(node) {
 }
 
 /**
+ * 이 노드가 "입장하였습니다." 시스템 메시지인지 판별
+ * 예: "레전드 OOO님이 입장하였습니다."
+ *     "<img ...>Lavina님이 입장하였습니다."
+ */
+function parseEnterSystemMessage(node) {
+    if (!node || !(node instanceof HTMLElement)) return null;
+
+    // enter 클래스가 붙은 시스템 입장 컨테이너만 대상
+    const container = node.querySelector(".live-comment-list-item-container.enter");
+    if (!container) return null;
+
+    // 내가 보낸 메시지는 무시 (내 닉으로 된 입장 알림 등)
+    if (isFromSelf(node)) return null;
+
+    const pre = container.querySelector(".comment-text pre");
+    if (!pre) return null;
+
+    const rawText = (pre.textContent || "").trim();
+    if (!rawText) return null;
+
+    const m = rawText.match(ENTER_MESSAGE_REGEX);
+    if (!m) return null;
+
+    const userName = (m[1] || "").trim();
+
+    // enterId는 data-index를 우선 사용
+    let enterId = null;
+    const indexContainer = node.closest("[data-index]");
+    if (indexContainer) {
+        enterId = indexContainer.getAttribute("data-index");
+    }
+    if (!enterId) {
+        enterId = rawText; // fallback
+    }
+
+    return {
+        enterId,
+        userName,
+        rawText,
+    };
+}
+
+/**
  * MutationObserver 콜백
  */
 function handleMutations(mutations) {
@@ -315,6 +440,9 @@ function handleMutations(mutations) {
                 if (li) targetNode = li;
             }
 
+            if (!targetNode) return;
+
+            // 1) 좋아요 시스템 메시지 체크
             const likeEvent = parseLikeSystemMessage(targetNode);
             if (likeEvent) {
                 console.log("✨ detected like system message:", likeEvent);
@@ -322,7 +450,21 @@ function handleMutations(mutations) {
                     ...likeEvent,
                     replyText: buildLikeReplyText(likeEvent),
                 });
+                return;
             }
+
+            // 2) 입장 시스템 메시지 체크
+            const enterEvent = parseEnterSystemMessage(targetNode);
+            if (enterEvent) {
+                console.log("✨ detected enter system message:", enterEvent);
+                enqueueEnterReply({
+                    ...enterEvent,
+                    replyText: buildEnterReplyText(enterEvent),
+                });
+                return;
+            }
+
+            // 3) 그 외 일반 채팅은 무시
         });
     }
 }
@@ -339,6 +481,26 @@ function buildLikeReplyText(likeEvent) {
         return `${userName}님, 좋아요 고마워요 💕`;
     }
     return "좋아요 고마워요 💕";
+}
+
+/**
+ * 입장에 대한 실제 자동응답 멘트 생성
+ */
+function buildEnterReplyText(enterEvent) {
+    const { userName } = enterEvent || {};
+    if (!userName) {
+        return "와주셔서 고마워요 💕";
+    }
+
+    const templates = [
+        `${userName}님 어서 와요 🥰`,
+        `${userName}님, 와줘서 고마워요 💕`,
+        `${userName}님 입장 환영해요 🫶`,
+        `어서오세요 ${userName}님 ✨`,
+    ];
+
+    const idx = Math.floor(Math.random() * templates.length);
+    return templates[idx];
 }
 
 /**
@@ -361,7 +523,7 @@ function initLikeObserver() {
         subtree: true,
     });
 
-    console.log("👀 Like MutationObserver attached");
+    console.log("👀 Like & Enter MutationObserver attached");
 }
 
 // 페이지 로드 후 약간 딜레이 두고 초기화
